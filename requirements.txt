@@ -1,0 +1,7 @@
+aiogram==2.25.1
+aiohttp
+pandas
+numpy
+scikit-learn
+joblib
+yfinance
