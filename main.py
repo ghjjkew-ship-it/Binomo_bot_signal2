@@ -6,19 +6,24 @@ import aiohttp
 import pandas as pd
 import numpy as np
 import joblib
-import asyncio
 
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.utils.executor import start_webhook
 from aiohttp import web
 from sklearn.linear_model import SGDClassifier
 
+# ------------------ CONFIG ------------------
 TG_TOKEN = os.getenv("TG_TOKEN", "8454094681:AAE6_6BSaEkQZabrxjEcDhIgMQSBbFMPqRI")
 CHAT_ID = int(os.getenv("CHAT_ID", "7830712705"))
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "74c58d1151144bb990851b622ba809b2")
 
-PAIR_TWELVE = "AUD/CAD"
-PAIR_YFIN = "AUDCAD=X"
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")  # Например: https://yourapp.onrender.com
+WEBHOOK_PATH = f"/webhook/{TG_TOKEN}"
+WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
+
+PAIR_TWELVE = "AUD/CAD"    # TwelveData format
+PAIR_YFIN = "AUDCAD=X"     # yfinance fallback
 
 DB_FILE = "bot_data.sqlite"
 MODEL_FILE = "model.joblib"
@@ -26,6 +31,7 @@ MODEL_FILE = "model.joblib"
 bot = Bot(token=TG_TOKEN)
 dp = Dispatcher(bot)
 
+# ------------------ DB ------------------
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cur = conn.cursor()
 cur.execute("""
@@ -42,6 +48,7 @@ CREATE TABLE IF NOT EXISTS signals (
 """)
 conn.commit()
 
+# ------------------ Model init ------------------
 if os.path.exists(MODEL_FILE):
     try:
         model = joblib.load(MODEL_FILE)
@@ -52,6 +59,7 @@ else:
     model = SGDClassifier(loss="log_loss")
     model.partial_fit(np.zeros((1,5)), [0], classes=[0,1])
 
+# ------------------ Features ------------------
 def compute_features_from_closes(closes: pd.Series):
     if len(closes) < 16:
         closes = pd.Series(list(closes) + [closes.iloc[-1]] * (16 - len(closes)))
@@ -75,6 +83,7 @@ def compute_features_from_closes(closes: pd.Series):
     feats = np.concatenate([norm_last3, [sma_diff, rsi]])
     return feats.reshape(1, -1)
 
+# ------------------ Data fetchers ------------------
 async def fetch_twelvedata(interval="1min", outputsize=100):
     url = ("https://api.twelvedata.com/time_series"
            f"?symbol={PAIR_TWELVE}"
@@ -112,6 +121,7 @@ async def get_closes():
         except Exception as e:
             raise RuntimeError("Data sources failed: " + str(e))
 
+# ------------------ Signal logic ------------------
 def decide_from_features(feats):
     rsi = feats[0, -1]
     if rsi < 30:
@@ -121,6 +131,7 @@ def decide_from_features(feats):
     pred = int(model.predict(feats)[0])
     return pred
 
+# ------------------ Telegram helpers ------------------
 def signal_keyboard():
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
@@ -129,34 +140,29 @@ def signal_keyboard():
     )
     return kb
 
-# Основное меню клавиатуры
-main_kb = ReplyKeyboardMarkup(resize_keyboard=True)
-main_kb.add(
-    KeyboardButton("/новый"),
-    KeyboardButton("/статистика")
-)
-
 async def send_signal(chat_id, dir_text, feats):
     text = (f"📢 <b>Сигнал: AUD/CAD (OTC)</b>\n"
             f"Направление: <b>{dir_text}</b>\n"
             f"Время (UTC): {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-            "Нажми: Верный ✅ / Неверный ❌ для обратной связи")
+            "Нажми: Верный / Неверный")
     msg = await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=signal_keyboard())
     feats_json = json.dumps(feats.tolist())
     predicted = 1 if dir_text == "BUY" else 0
     cur.execute("INSERT INTO signals (ts, chat_id, message_id, pair, features, predicted, label) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (datetime.utcnow().isoformat(), chat_id, msg.message_id, PAIR_TWELVE, feats_json, predicted, None))
+                (datetime.utcnow().isoformat(), chat_id, msg.message_id, "AUD/CAD", feats_json, predicted, None))
     conn.commit()
     return msg.message_id
 
+# ------------------ Handlers ------------------
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
-    txt = (
-        "👋 Привет! Я бот сигналов AUD/CAD OTC.\n\n"
-        "Используй кнопки ниже, чтобы получить сигнал или посмотреть статистику.\n"
-        "Создатель бота: Nurik."
-    )
-    await message.answer(txt, reply_markup=main_kb)
+    txt = ("Привет! Я бот сигналов.\n\n"
+           "Команды:\n"
+           "/новый — получить новый сигнал\n"
+           "/статистика — посмотреть точность по пометкам\n\n"
+           "Нажми кнопку 'Новый сигнал', чтобы получить сигнал.")
+    keyboard = InlineKeyboardMarkup().add(InlineKeyboardButton("Новый сигнал", callback_data="new_signal"))
+    await message.reply(txt, reply_markup=keyboard)
 
 @dp.message_handler(commands=["новый"])
 async def cmd_new(message: types.Message):
@@ -208,21 +214,38 @@ async def cb_feedback(callback: types.CallbackQuery):
         pass
     await callback.answer("Фидбек сохранён ✅")
 
-async def start_polling():
-    await dp.start_polling()
+@dp.callback_query_handler(lambda c: c.data == "new_signal")
+async def cb_new_signal(callback: types.CallbackQuery):
+    await callback.answer("Генерирую сигнал... ⏳")
+    try:
+        closes = await get_closes()
+    except Exception as e:
+        await callback.message.answer(f"Ошибка получения данных: {e}")
+        return
+    feats = compute_features_from_closes(closes)
+    pred = decide_from_features(feats)
+    dir_text = "BUY" if pred == 1 else "SELL"
+    await send_signal(callback.message.chat.id, dir_text, feats)
 
+# ------------------ Webhook setup ------------------
 async def on_startup(app):
-    app['polling_task'] = asyncio.create_task(start_polling())
+    await bot.set_webhook(WEBHOOK_URL)
 
-async def on_cleanup(app):
-    app['polling_task'].cancel()
-    await bot.close()
+async def on_shutdown(app):
+    await bot.delete_webhook()
+    conn.close()
 
 app = web.Application()
-app.on_startup.append(on_startup)
-app.on_cleanup.append(on_cleanup)
-
-port = int(os.getenv("PORT", 8000))
+app.router.add_post(WEBHOOK_PATH, dp)
 
 if __name__ == "__main__":
-    web.run_app(app, port=port)
+    start_webhook(
+        dispatcher=dp,
+        webhook_path=WEBHOOK_PATH,
+        on_startup=on_startup,
+        on_shutdown=on_shutdown,
+        skip_updates=True,
+        app=app,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 8000)),
+)
