@@ -4,4 +4,4 @@ pandas
 numpy
 scikit-learn
 joblib
-yfinance
+matplotlib
